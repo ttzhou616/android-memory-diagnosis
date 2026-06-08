@@ -14,7 +14,9 @@ category: software-development
 - 用户想知道针对某种症状该用什么工具
 - 用户有 `.hprof` 文件需要分析
 
-## 概念基础：泄漏 vs 溢出
+## 概念基础：泄漏、溢出、抖动
+
+三者是 Android 内存问题的三种形态，需要区分清楚才能选对工具和对策。
 
 ### 类比
 
@@ -60,6 +62,63 @@ Android 给每个进程分配固定的堆上限，远小于 PC：
 | 4 | **线程过多** | 每个线程默认 1MB 栈，200 个线程 = 200MB |
 | 5 | **代码膨胀** | 方法数超 64K（MultiDex）或加载过多类 → Code 内存区溢出 |
 
+### 内存抖动（Memory Churn）
+
+**定义**：短时间内大量创建临时对象 → 立即丢弃 → GC 被反复触发 → 回收虽然成功，但 GC 暂停时间累积 → UI 卡顿（不是崩溃，是掉帧）。
+
+**类比**：
+
+```
+泄漏 = 仓库里堆满废品，没人清理 → 终有一天塞爆
+溢出 = 仓库爆了，新货进不来
+抖动 = 仓管（GC）疯狂进出、反复清点——仓库没爆，但一直在"盘点中"，正常作业被频繁打断
+```
+
+**本质区别**：
+
+| | 泄漏 | 溢出 | 抖动 |
+|---|------|------|------|
+| **对象是否回收** | ❌ 永不回收 | —（已崩溃） | ✅ 正常回收 |
+| **问题在哪** | GC Root 阻止回收 | 堆空间不够 | **回收太频繁** |
+| **表现** | 内存曲线持续 ↗ | 抛出 OOM 异常 | 内存曲线锯齿状剧烈振荡 |
+| **影响** | 最终 OOM | 立刻崩溃 | 掉帧、卡顿，但不崩溃 |
+| **首选工具** | 堆转储 (Heap Dump) | 实时视图 + 堆转储 | **分配记录 (Allocations)** |
+
+**抖动常见场景**：
+
+| 场景 | 代码示例 | 为什么抖 |
+|------|---------|---------|
+| onDraw / Canvas 循环里 new 对象 | `for (i in 0..100) { drawText("$i", Paint(), ...) }` | 每帧创建 100 个 Paint + 100 个 String |
+| Compose 高频重组 | Composable 函数里直接 `Array(200) { GNode(...) }` | 每帧重组 = 每帧 new 200 个对象 |
+| 列表 item 里创建临时对象 | 每次重组都重复分配耗时对象 | 滚动列表时高频创建/丢弃 |
+| 字符串拼接循环 | `for (x in list) { result += "item_$x\n" }` | 每次 `+=` 创建一个新 String |
+| 自动装箱 | `Integer count = 0; for (...) count++` | 每次 ++ 都 `Integer.valueOf()` 分配一个新 Integer |
+
+**抖动严重程度衡量**：
+
+```
+adb logcat | grep "art.*GC"
+
+输出示例：
+  GC: concurrent copying freed 8542(512KB), paused 1.2ms total 18ms
+  GC: concurrent copying freed 12034(768KB), paused 2.5ms total 28ms
+  ...（疯狂出现）
+```
+
+- **GC 日志出现频率异常高**（每秒多次）= 抖动严重
+- **paused > 5ms** = 用户可感知的掉帧（60fps 下每帧只有 16ms，GC 吃掉 5ms 就只剩 11ms）
+- 如果 GC 日志像刷屏一样 = 必须优化
+
+**抖动修复策略**：
+
+| 策略 | 怎么做 |
+|------|--------|
+| **对象复用** | Paint 等重对象用 `remember { }` 缓存，不要每帧 new |
+| **预构建** | 字符串在 Composable 外面提前构建好，不要每帧拼接 |
+| **移到循环外** | `for` 循环里反复 new 的对象提到循环外，循环内只改参数 |
+| **用基本类型** | 避免自动装箱，用 `IntArray` 代替 `List<Int>` |
+| **Object Pool** | 高频创建/销毁的对象用对象池（`android.util.Pools`）
+
 ## 三层策略：预防 → 监控 → 急救
 
 ### 第一层：预防（写代码时就应该做的）
@@ -73,6 +132,7 @@ Android 给每个进程分配固定的堆上限，远小于 PC：
 | Handler/Runnable | `onDestroy` 里 `removeCallbacks(null)` |
 | Compose DisposableEffect | `onDispose` 里必须反注册 |
 | 线程/协程 | 用 `lifecycleScope` / `viewModelScope`，禁用 `GlobalScope` |
+| **内存抖动** | Canvas 里对象复用 `remember { Paint() }`；字符串预构建；循环里 new 的对象提到外部 |
 
 ### 第二层：监控（运行时发现苗头）
 
@@ -81,7 +141,8 @@ Android 给每个进程分配固定的堆上限，远小于 PC：
 | **LeakCanary** | Activity/Fragment 泄漏 | **强烈推荐集成**，通知栏直接弹 |
 | **Android Studio Profiler** | 实时内存曲线 + 堆转储 | 开发阶段主动跑 |
 | **`dumpsys meminfo`** | Pss 精确值 | Pss > 200MB 要警惕 |
-| **GC 日志** | GC 频率 + 回收量 + 暂停时长 | `adb logcat \| grep "art.*GC"` |
+| **GC 日志** | GC 频率 + 回收量 + 暂停时长 | `adb logcat \| grep "art.*GC"`；频率异常高 = 抖动 |
+| **Android Studio Profiler 分配记录** | 高频分配的对象类型 | 按 Count 降序，找反复出现的短命对象 |
 
 ### 第三层：急救（已经 OOM 了怎么办）
 
