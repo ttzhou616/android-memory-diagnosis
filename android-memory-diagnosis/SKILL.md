@@ -106,6 +106,29 @@ GC: concurrent copying freed 12034(768KB), paused 2.5ms total 28ms
 - GC 日志刷屏 = 必须优化
 - `paused > 5ms` = 用户可感知掉帧（60fps 每帧仅 16ms）
 
+### 中间态：Old Gen 堆积（非泄漏，但对象活太久）
+
+有一种情况介于抖动和泄漏之间——对象不是泄漏（最终会被回收），但活得比该活的久，导致它们被晋升到 Old Gen。Young GC 够不着，只能在 Full-heap CC 时才被回收。
+
+**GC 日志特征**：
+
+```
+Young GC:   freed 8542(512KB)     ← 每次回收获利极低
+Full-heap:  freed 12034(30MB)     ← 一次性回收量巨大
+```
+
+**结论**：垃圾不在 Young Gen（Young GC 捞不到），全堆积在 Old Gen → 不是泄漏，是对象生命周期过长 → **追到单例 addCallback 不 remove、缓存永不过期、Listener 注册后不反注册但最终还是会被清除。**
+
+### LOS 碎片化：OOM 但内存显示很空
+
+```
+OutOfMemoryError: Failed to allocate 1MB, 200MB until OOM
+```
+
+CC GC 的 Region 整块释放确实无**外部碎片**，但 **Large Object Space（≥128KB 对象）用 free-list 管理，无压缩**。频繁创建/释放不同大小的大对象（如图片处理中的临时 byte 数组）→ LOS 内部碎片 → 1MB 连续空闲块耗尽，总空闲却还有 200MB。
+
+> **修复**：`BitmapFactory.Options.inBitmap` 复用大数组；降采样后处理；避免频繁分配不同大小的大对象进 LOS。
+
 ---
 
 ## 二、防问题：开发阶段预防清单
@@ -121,6 +144,8 @@ GC: concurrent copying freed 12034(768KB), paused 2.5ms total 28ms
 | 线程/协程 | 用 `lifecycleScope`，禁用 `GlobalScope` |
 | Canvas 里 new 对象 | `remember { Paint() }` 复用 |
 | 字符串拼接循环 | 用 `StringBuilder` 或预构建 |
+| **onTrimMemory** | 分代感知分层释放：`MODERATE` 释 Young 缓存 / `COMPLETE` 清 Old Gen 重对象 |
+| **largeHeap 决策** | 先查 Live Set 是否合理；堆翻倍 → Full-heap CC 扫描翻倍 → GC 吞吐下降 |
 
 **监控手段**（运行时发现苗头）：
 
@@ -265,6 +290,16 @@ class MyActivity : Activity() {
 
 ### 抖动案例
 
+**案例 0：掉帧定界——先判 GC 还是 Layout**
+
+RecyclerView 滑动掉帧时，不懂 GC 的人从布局层级→图片加载→ViewHolder 逐个排查，可能花几天。正确路径是**两分钟定界**：
+
+1. Profiler → MEMORY 曲线 → 看掉帧时刻有没有 GC 标记（锯齿尖上的垃圾桶图标）
+2. **有 GC 标记** → GC 抖动 → Record Allocations → 按 Count 排序 → 定位 `onBindViewHolder` 里每 item 都 `new` 的对象 → 提到成员变量或 `companion object`
+3. **没有 GC 标记** → Layout/渲染问题 → 走 layout inspector / GPU 渲染分析
+
+> **热路径零分配** — `onDraw`、`onBindViewHolder`、Compose 重组等每帧/每次调用的路径里，避免 `new` 对象。Paint、Path、SimpleDateFormat 等高频类用成员变量或 `remember { }` 持有。
+
 **案例 5：Canvas 每帧 new 对象**
 
 ```kotlin
@@ -284,6 +319,22 @@ Canvas {
 3. **旋转测试**：旋转 5 次 → 堆转储 → Activity 数仍为 1
 4. **切后台测试**：回桌面 → 返回 → Activity 数仍为 1
 5. MAT：修复前后 .hprof 加入 Compare Basket 对比
+
+### GC 健康度量化基线
+
+修复后不只看"有没有问题"，还要量化"有多健康"。一次 10 分钟典型会话的健康基线：
+
+| 指标 | 健康值 | 警告值 | 危险值 |
+|------|--------|--------|--------|
+| **Young GC 频率** | < 20 次/分钟 | 20-40 次/分钟 | > 40 次/分钟 |
+| **Full-heap CC 频率** | < 1 次/分钟 | 1-3 次/分钟 | > 3 次/分钟 |
+| **最大 GC 暂停** | < 5ms | 5-16ms | > 16ms（掉帧） |
+| **Allocation Rate** | < 10MB/s | 10-30MB/s | > 30MB/s |
+| **Live Set** | < 堆上限的 30% | 30-50% | > 50% |
+
+**健康判定**：Young GC < 20 次/分钟 + 所有暂停在 16ms 帧预算内 + Allocation Rate < 10MB/s → **GC 健康，无掉帧风险**。
+
+> 注：不只看峰值内存。峰值 150MB 如果 GC 频率正常 = 没问题；峰值 80MB 但 GC 每秒触发 = 严重问题。
 
 ---
 
@@ -371,3 +422,5 @@ SELECT * FROM INSTANCEOF com.example.LeakRegistry
 - **内存分析必须 debuggable 模式。**
 - **抓堆转储时 Java 内存临时增加** — 正常现象。
 - **LEAK 的 GC Root 最常见是 STATIC 字段** — 搜 `object` / `companion object` 优先。
+
+> 进阶：GC 分代原理、onTrimMemory 分层释放、largeHeap 代价分析、LOS 碎片化机制 → 详见 [[android-gc-troubleshooting]]
