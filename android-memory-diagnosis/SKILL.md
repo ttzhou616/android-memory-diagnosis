@@ -41,6 +41,20 @@ category: software-development
 
 对象已不需要，但被 GC Root 间接持有，GC 判定它"还活着"，永远不回收。泄漏的终局通常是 OOM——但不是所有 OOM 都因为泄漏。
 
+**常见泄漏场景**：
+
+| 场景 | 持有者 | 泄漏对象 | 典型原因 |
+|------|--------|---------|---------|
+| 静态字段持有 Context | `object` 单例 | Activity / Fragment | 注册了但永远不反注册 |
+| DisposableEffect 忘 onDispose | Compose 副作用 | Composable 作用域内对象 | `onDispose {}` 留空 |
+| 线程/协程超出作用域 | 活跃线程 | 局部变量（大数据） | 线程没 interrupt / 协程没 cancel |
+| Handler / Runnable 延迟执行 | MessageQueue | Activity 内部类 | `postDelayed` 后没 `removeCallbacks` |
+| 回调/Listener 注册不反注册 | EventBus / 单例 | Activity / Fragment | `register` 了但忘了 `unregister` |
+| 匿名内部类持有外部引用 | 非静态内部类 | Activity | `this$0` 隐式引用 |
+| WebView 未销毁 | WebView 内部引擎 | Activity + 大量 native 内存 | `destroy()` 没调或时机不对 |
+
+> 检测方法和修复代码见下方「五、修问题」。
+
 ### 内存溢出 (OutOfMemoryError)
 
 JVM/ART 尝试分配内存时堆里找不到足够大的连续空间，抛出 `OutOfMemoryError`。
