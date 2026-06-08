@@ -14,7 +14,114 @@ category: software-development
 - 用户想知道针对某种症状该用什么工具
 - 用户有 `.hprof` 文件需要分析
 
-## 诊断所需材料
+## 概念基础：泄漏 vs 溢出
+
+### 类比
+
+```
+一个漏水的水桶：
+
+  内存泄漏 = 桶底有个小洞，水一直在漏
+    → 桶里可用空间越来越小
+    → 漏得慢可能几小时才见底，不是立刻致命的
+
+  内存溢出 = 桶里的水完全干了，你还想往外舀一瓢
+    → 系统说："没了！一滴都没了！"
+    → OutOfMemoryError → 应用崩溃
+```
+
+### 技术定义
+
+> **内存泄漏（Memory Leak）**：对象已不再需要，但被 GC Root 间接持有，GC 判定它"还活着"，永远不回收。堆内存被僵尸对象占据，可用空间持续缩小。**泄漏通常导致溢出，但溢出不一定因为泄漏。**
+
+> **内存溢出（OutOfMemory, OOM）**：JVM/ART 尝试分配一块内存时，堆里找不到足够大的连续空间，抛出 `OutOfMemoryError`。**这是泄漏最常见的终局表现，但不是唯一原因。**
+
+示例：一次加载一张 100MB 的图片——没有泄漏，但堆不够大，直接 OOM。
+
+### Android 堆内存硬上限
+
+Android 给每个进程分配固定的堆上限，远小于 PC：
+
+| 设备类型 | 典型堆上限 |
+|---------|-----------|
+| 低端机（2GB RAM） | 128-192 MB |
+| 中端机（4GB RAM） | 256-384 MB |
+| 高端机（8GB+ RAM） | 512 MB+ |
+
+这意味着 PC 上不痛不痒的分配，在 Android 上可能就是致命一击。
+
+### OOM 五大常见场景
+
+| 排名 | 场景 | 为什么 |
+|------|------|--------|
+| 1 | **Bitmap 加载过大** | 4000×3000 ARGB_8888 = 48MB，一张照片吃掉堆的 1/4 |
+| 2 | **内存泄漏累积** | 单次泄漏 1MB × 用户使用 30 分钟 = 30MB → 再加载图片 → OOM |
+| 3 | **大对象一次性分配** | `ByteArray(100MB)` 在 192MB 堆设备上 → 直接 OOM |
+| 4 | **线程过多** | 每个线程默认 1MB 栈，200 个线程 = 200MB |
+| 5 | **代码膨胀** | 方法数超 64K（MultiDex）或加载过多类 → Code 内存区溢出 |
+
+## 三层策略：预防 → 监控 → 急救
+
+### 第一层：预防（写代码时就应该做的）
+
+| 问题 | 预防手段 |
+|------|---------|
+| Bitmap 过大 | `BitmapFactory.Options.inSampleSize` 降采样；用 Glide/Coil 自动处理 |
+| 图片列表 | RecyclerView + 图片库 LRU 缓存，不可见图及时回收 |
+| 大文件读取 | 流式读、mmap、分块处理，别一次性 `readBytes()` |
+| 静态持有 Context | `object` 里存 `Activity` 用 `WeakReference` 或 `ApplicationContext` |
+| Handler/Runnable | `onDestroy` 里 `removeCallbacks(null)` |
+| Compose DisposableEffect | `onDispose` 里必须反注册 |
+| 线程/协程 | 用 `lifecycleScope` / `viewModelScope`，禁用 `GlobalScope` |
+
+### 第二层：监控（运行时发现苗头）
+
+| 手段 | 查出什么 | 建议 |
+|------|---------|------|
+| **LeakCanary** | Activity/Fragment 泄漏 | **强烈推荐集成**，通知栏直接弹 |
+| **Android Studio Profiler** | 实时内存曲线 + 堆转储 | 开发阶段主动跑 |
+| **`dumpsys meminfo`** | Pss 精确值 | Pss > 200MB 要警惕 |
+| **GC 日志** | GC 频率 + 回收量 + 暂停时长 | `adb logcat \| grep "art.*GC"` |
+
+### 第三层：急救（已经 OOM 了怎么办）
+
+以下代码放在可能触发 OOM 的地方：
+
+```kotlin
+try {
+    val bitmap = BitmapFactory.decodeFile(path)
+} catch (e: OutOfMemoryError) {
+    // ① 降级：用更小的采样率重试
+    val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+    val smallerBitmap = BitmapFactory.decodeFile(path, opts)
+
+    // ② 清缓存：把 LRU 缓存清掉腾空间
+    imageCache.evictAll()
+
+    // ③ 建议 GC（只是建议，不保证立即执行）
+    Runtime.getRuntime().gc()
+
+    // ④ 重试
+    val retryBitmap = BitmapFactory.decodeFile(path, opts)
+}
+```
+
+**治本**：急救之后再按诊断决策树抓堆转储 → 分析 → 修复，不要止步于 `catch`。
+
+### 三层关系
+
+```
+预防（第一层）
+  └── 写代码时做好 → 90% 的 OOM 不会发生
+        │
+        └── 漏网之鱼 → 监控（第二层）在运行时抓住
+              │
+              └── 监控没拦住 → 急救（第三层）保用户不崩溃
+                    │
+                    └── 然后按诊断决策树治本
+```
+
+## 诊断决策树
 
 按优先级排序——**有一个第一梯队就能干活，下面的是加分项。**
 
