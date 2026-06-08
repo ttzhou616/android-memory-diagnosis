@@ -304,7 +304,7 @@ class MyActivity : Activity() {
 
 ### 抖动案例
 
-**案例 0：掉帧定界——先判 GC 还是 Layout**
+**案例 5：掉帧定界——先判 GC 还是 Layout**
 
 RecyclerView 滑动掉帧时，不懂 GC 的人从布局层级→图片加载→ViewHolder 逐个排查，可能花几天。正确路径是**两分钟定界**：
 
@@ -314,7 +314,7 @@ RecyclerView 滑动掉帧时，不懂 GC 的人从布局层级→图片加载→
 
 > **热路径零分配** — `onDraw`、`onBindViewHolder`、Compose 重组等每帧/每次调用的路径里，避免 `new` 对象。Paint、Path、SimpleDateFormat 等高频类用成员变量或 `remember { }` 持有。
 
-**案例 5：Canvas 每帧 new 对象**
+**案例 6：Canvas 每帧 new 对象**
 
 ```kotlin
 Canvas {
